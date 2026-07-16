@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+# mpreg v8.0 - The MrrpOS Package REGistrar
+# By ANW for MrrpOS
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import hashlib
+from pathlib import Path
+
+try:
+    import requests
+    from colorama import init, Fore, Style
+except ImportError:
+    sys.exit(1)
+
+init(autoreset=True)
+
+BASE = Path("/mrrpos/mpreg")
+BIN_DIR = BASE / "bin"
+SYS_BIN = Path("/mrrpos/bin")
+CACHE_DIR = BASE / "cache"
+INSTALLED_FILE = BASE / "installed.json"
+
+PACKAGE_LIST_URL = "https://mrrpos.gattodev.tech/pkgs/pkg-list.php"
+MISC_LIST_URL = "https://mrrpos.gattodev.tech/misc/misc-list.php"
+HEADERS = {"User-Agent": "mpreg/8.0 (MrrpOS)"}
+
+def ensure_dirs():
+    sys.stdout.write(f"{Fore.CYAN}[*] verifying system directories...\n")
+    for d in (BASE, BIN_DIR, SYS_BIN, CACHE_DIR):
+        if not d.exists():
+            sys.stdout.write(f"{Fore.CYAN}[*] creating directory: {d}\n")
+            d.mkdir(parents=True, exist_ok=True)
+    if not INSTALLED_FILE.exists():
+        sys.stdout.write(f"{Fore.CYAN}[*] initializing empty registry: {INSTALLED_FILE}\n")
+        INSTALLED_FILE.write_text("{}")
+    sys.stdout.write(f"{Fore.GREEN}[s] mpreg system directories verified.\n")
+
+def load_installed():
+    try:
+        return json.loads(INSTALLED_FILE.read_text())
+    except:
+        return {}
+
+def save_installed(data):
+    INSTALLED_FILE.write_text(json.dumps(data, indent=2))
+    sys.stdout.write(f"{Fore.GREEN}[s] registry updated and saved.\n")
+
+def fetch_json(url):
+    cache = CACHE_DIR / Path(url).name
+    try:
+        sys.stdout.write(f"{Fore.CYAN}[*] fetching metadata from {url}...\n")
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        cache.write_text(json.dumps(data))
+        sys.stdout.write(f"{Fore.GREEN}[s] metadata downloaded and cached.\n")
+        return data
+    except:
+        sys.stdout.write(f"{Fore.RED}[x] network error while fetching manifest.\n{FORE.CYAN}[*] checking local manifest in cache...\n")
+        if cache.exists():
+            try:
+                sys.stdout.write(f"{Fore.BLUE}[i] using cached version of {Path(url).name}.\n")
+                return json.loads(cache.read_text())
+            except:
+                pass
+        sys.stdout.write(f"{Fore.RED}[x] no valid cache available for {Path(url).name}.\n")
+        return None
+
+def verify_checksum(file_path, expected):
+    sys.stdout.write(f"{Fore.CYAN}[*] calculating SHA256 for {file_path.name}...\n")
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    result = h.hexdigest().lower()
+    match = result == expected.lower()
+    if match:
+        sys.stdout.write(f"{Fore.GREEN}[s] checksum verified: {result[:8]}...\n")
+    else:
+        sys.stdout.write(f"{Fore.RED}[x] checksum mismatch! expected {expected}, got {result}\n")
+    return match
+
+def download(url, dest, total_size=0, expected_hash=None):
+    tmp = dest.with_suffix(".part")
+    sys.stdout.write(f"{Fore.CYAN}[*] initiating download from {url}...\n")
+    try:
+        with requests.get(url, headers=HEADERS, stream=True, timeout=20) as r:
+            r.raise_for_status()
+            if total_size == 0:
+                total_size = int(r.headers.get("Content-Length", 0))
+            with open(tmp, "wb") as f:
+                got = 0
+                for chunk in r.iter_content(8192):
+                    if chunk:
+                        f.write(chunk)
+                        got += len(chunk)
+                        if total_size > 0:
+                            pct = int((got / total_size) * 100)
+                            sys.stdout.write(f"\r\033[K{Fore.CYAN}[*] downloading: {got}/{total_size} bytes ({pct}%)")
+                        else:
+                            sys.stdout.write(f"\r\033[K{Fore.CYAN}[*] downloading: {got} bytes")
+                        sys.stdout.flush()
+        sys.stdout.write("\n")
+        sys.stdout.write(f"{Fore.GREEN}[s] download completed.\n")
+        if expected_hash and not verify_checksum(tmp, expected_hash):
+            sys.stdout.write(f"{Fore.RED}[x] aborting due to checksum failure.\n")
+            tmp.unlink(missing_ok=True)
+            return False
+        tmp.replace(dest)
+        return True
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        sys.stdout.write(f"\n{Fore.RED}[x] download failed: {e}\n")
+        return False
+
+def execute_micro_lang(cmd_str, download_path, target_bin, pkg_id):
+    cmds = cmd_str.split(";")
+    curr_file = download_path
+
+    sys.stdout.write(f"{Fore.CYAN}[*] executing MML sequence: {cmd_str}\n")
+
+    for c in cmds:
+        c = c.strip()
+        if not c:
+            continue
+        if c.startswith("X"):
+            sys.stdout.write(f"{Fore.CYAN}[*] X - extracting archive {curr_file.name} to {target_bin}...\n")
+            out = subprocess.check_output(["tar", "-tf", str(curr_file)], text=True).splitlines()
+            extracted_name = out[0].strip()
+            subprocess.run(["tar", "--zstd", "-xf", str(curr_file), "-C", str(target_bin)], check=True)
+            curr_file = target_bin / extracted_name
+        elif c.startswith("M"):
+            curr_file = target_bin / download_path.name
+            sys.stdout.write(f"{Fore.CYAN}[*] M - moving binary to {curr_file}...\n")
+            shutil.move(str(download_path), str(curr_file))
+        elif c.startswith("N"):
+            new_name = c[1:]
+            new_path = curr_file.parent / new_name
+            sys.stdout.write(f"{Fore.CYAN}[*] N - renaming binary to {new_name}...\n")
+            shutil.move(str(curr_file), str(new_path))
+            curr_file = new_path
+        elif c.startswith("C"):
+            sys.stdout.write(f"{Fore.CYAN}[*] C - setting executable permissions on {curr_file.name}...\n")
+            subprocess.run(["sudo", "chmod", "+x", str(curr_file)], check=True)
+        elif c.startswith("R"):
+            sys.stdout.write(f"{Fore.CYAN}[*] R - running shell command: {c[1:]}\n")
+            subprocess.run(c[1:], shell=True, check=True)
+        elif c.startswith("D"):
+            target_f = target_bin / pkg_id
+            sys.stdout.write(f"{Fore.CYAN}[*] D - deleting binary {pkg_id} from {target_bin}...\n")
+            if target_f.exists():
+                if target_f.is_dir():
+                    shutil.rmtree(target_f)
+                else:
+                    target_f.unlink()
+            else:
+                sys.stdout.write(f"{Fore.YELLOW}[!] binary {pkg_id} not found, skipping deletion.\n")
+
+def resolve_py_deps(deps):
+    missing = []
+    for d in deps:
+        sys.stdout.write(f"{Fore.CYAN}[*] checking Python dependency: {d}...\n")
+        try:
+            __import__(d)
+            sys.stdout.write(f"{Fore.GREEN}[s] {d} is present.\n")
+        except ImportError:
+            sys.stdout.write(f"{Fore.RED}[x] {d} is missing.\n")
+            missing.append(d)
+    if missing:
+        ans = input(f"{Fore.WHITE}[?] install missing Python modules via pip? ({', '.join(missing)}) [Y/n]: ")
+        if ans.lower() != 'n':
+            sys.stdout.write(f"{Fore.CYAN}[*] installing Python dependencies...\n")
+            subprocess.run(["pip3", "install"] + missing)
+            sys.stdout.write(f"{Fore.GREEN}[s] Python dependencies installed.\n")
+
+def resolve_deps(deps):
+    inst = load_installed()
+    for d in deps:
+        sys.stdout.write(f"{Fore.CYAN}[*] checking package dependency: {d}...\n")
+        if d not in inst:
+            sys.stdout.write(f"{Fore.YELLOW}[!] dependency {d} is missing. initiating install...\n")
+            install_pkg(d)
+        else:
+            sys.stdout.write(f"{Fore.GREEN}[s] {d} is already installed.\n")
+
+def install_pkg(pkg_id):
+    sys.stdout.write(f"{Fore.CYAN}[*] preparing to install package '{pkg_id}'...\n")
+    data = fetch_json(PACKAGE_LIST_URL)
+    if not data or pkg_id not in data:
+        sys.stdout.write(f"{Fore.RED}[x] package '{pkg_id}' not found in repository.\n")
+        return
+
+    entry = data[pkg_id]
+    sys.stdout.write(f"{Fore.CYAN}[*] validating standards...\n")
+    if not all(k in entry for k in ("id", "name", "version", "author", "license", "dependencies", "py_dependencies", "description", "install_cmd", "uninstall_cmd")):
+        sys.stdout.write(f"{Fore.RED}[x] manifest is missing required fields.\n")
+        return
+    sys.stdout.write(f"{Fore.GREEN}[s] manifest is valid.\n")
+
+    inst = load_installed()
+    if pkg_id in inst:
+        if inst[pkg_id].get("version") == entry.get("version"):
+            ans = input(f"{Fore.WHITE}[?] {pkg_id} {entry.get('version')} is already installed. force reinstall? [y/N]: ")
+            if ans.lower() != 'y':
+                sys.stdout.write(f"{Fore.RED}[x] installation aborted by user.\n")
+                return
+        sys.stdout.write(f"{Fore.CYAN}[*] upgrading {pkg_id} from {inst[pkg_id].get('version')} to {entry.get('version')}...\n")
+        execute_micro_lang(entry["uninstall_cmd"], None, SYS_BIN if pkg_id == "mpreg" else BIN_DIR, pkg_id)
+
+    resolve_py_deps(entry.get("py_dependencies", []))
+    resolve_deps(entry.get("dependencies", []))
+
+    dl_url = entry.get("download")
+    if dl_url == "soon":
+        sys.stdout.write(f"{Fore.YELLOW}[!] package binary is marked as 'soon'. aborting.\n")
+        return
+
+    dest = CACHE_DIR / Path(dl_url).name
+    expected_hash = entry.get("sha256")
+    size = entry.get("size_bytes", 0)
+
+    if dest.exists() and expected_hash and verify_checksum(dest, expected_hash):
+        sys.stdout.write(f"{Fore.GREEN}[s] cached binary matched checksum. skipping download.\n")
+    else:
+        if not download(dl_url, dest, size, expected_hash):
+            return
+
+    target_dir = SYS_BIN if pkg_id == "mpreg" else BIN_DIR
+    try:
+        execute_micro_lang(entry.get("install_cmd", ""), dest, target_dir, pkg_id)
+        inst[pkg_id] = {
+            "version": entry.get("version"),
+            "author": entry.get("author"),
+            "license": entry.get("license"),
+            "installed_at": int(time.time())
+        }
+        save_installed(inst)
+        sys.stdout.write(f"{Fore.GREEN}[s] {pkg_id} installed successfully. <<<\n")
+    except Exception as e:
+        sys.stdout.write(f"{Fore.RED}[x] fatal installation error: {e}\n")
+
+def uninstall_pkg(pkg_id):
+    sys.stdout.write(f"{Fore.CYAN}[*] preparing to uninstall '{pkg_id}'...\n")
+    data = fetch_json(PACKAGE_LIST_URL)
+    inst = load_installed()
+    if pkg_id not in inst:
+        sys.stdout.write(f"{Fore.RED}[x] package '{pkg_id}' is not installed.\n")
+        return
+
+    ucmd = "D"
+    if data and pkg_id in data:
+        sys.stdout.write(f"{Fore.CYAN}[*] fetching uninstall sequence...\n")
+        ucmd = data[pkg_id].get("uninstall_cmd", "D")
+    else:
+        sys.stdout.write(f"{Fore.YELLOW}[!] repository data not found, defaulting to safe deletion.\n")
+
+    try:
+        execute_micro_lang(ucmd, None, SYS_BIN if pkg_id == "mpreg" else BIN_DIR, pkg_id)
+        del inst[pkg_id]
+        save_installed(inst)
+        sys.stdout.write(f"{Fore.GREEN}[s] {pkg_id} uninstalled successfully. <<<\n")
+    except Exception as e:
+        sys.stdout.write(f"{Fore.RED}[x] fatal uninstall error: {e}\n")
+
+def pack_pkg(binary):
+    bpath = Path(binary)
+    if not bpath.exists():
+        sys.stdout.write(f"{Fore.RED}[x] binary file not found: {binary}\n")
+        return
+    out = f"{bpath.name}.mpreg"
+    sys.stdout.write(f"{Fore.CYAN}[*] performing zstd level 19 compression for {bpath.name}...\n")
+    subprocess.run(["tar", "-I", "zstd -19", "-cf", out, bpath.name], check=True)
+    sys.stdout.write(f"{Fore.GREEN}[s] done, packed to: {out}\n")
+
+def check_pkgs():
+    sys.stdout.write(f"{Fore.CYAN}[*] performing mpreg registry check...\n")
+    inst = load_installed()
+    data = fetch_json(PACKAGE_LIST_URL)
+    if not data:
+        sys.stdout.write(f"{Fore.RED}[x] cannot fetch remote data for verification.\n")
+        return
+    for pkg_id, meta in inst.items():
+        if pkg_id in data and data[pkg_id].get("sha256"):
+            target = SYS_BIN / pkg_id if pkg_id == "mpreg" else BIN_DIR / pkg_id
+            sys.stdout.write(f"{Fore.CYAN}[*] validating {pkg_id} at {target}... ")
+            if target.exists():
+                if verify_checksum(target, data[pkg_id]["sha256"]):
+                    sys.stdout.write(f"{Fore.GREEN}CLEAN\n")
+                else:
+                    sys.stdout.write(f"{Fore.RED}MISMATCH\n")
+            else:
+                sys.stdout.write(f"{Fore.RED}NOT FOUND\n")
+    sys.stdout.write(f"{Fore.GREEN}[s] integrity check complete.\n")
+
+def list_pkgs():
+    sys.stdout.write(f"{Fore.CYAN}[*] loading remote package database...\n")
+    data = fetch_json(PACKAGE_LIST_URL)
+    if not data:
+        return
+    sys.stdout.write(f"\n{Fore.WHITE}{'package':<20} | {'version':<8} | {'author':<15} | {'description'}\n")
+    sys.stdout.write("-" * 75 + "\n")
+    for k, v in data.items():
+        sys.stdout.write(f"{Fore.CYAN}{k:<20} {Fore.WHITE}| {v.get('version','?'):<8} | {v.get('author','Unknown'):<15} | {v.get('description','')}\n")
+    sys.stdout.write("\n")
+
+def list_misc():
+    sys.stdout.write(f"{Fore.CYAN}[*] loading remote miscellaneous database...\n")
+    data = fetch_json(MISC_LIST_URL)
+    if not data:
+        return
+    for cat, items in data.items():
+        sys.stdout.write(f"\n{Fore.MAGENTA}[{cat}]\n")
+        for k, v in items.items():
+            sys.stdout.write(f"{Fore.YELLOW}{k:<20} {Fore.WHITE}| By: {v.get('author','Unknown'):<15} | {v.get('description','')}\n")
+    sys.stdout.write("\n")
+
+def list_cache():
+    sys.stdout.write(f"{Fore.CYAN}[*] inspecting cache directory: {CACHE_DIR}\n")
+    if not CACHE_DIR.exists() or not any(CACHE_DIR.iterdir()):
+        sys.stdout.write(f"{Fore.BLUE}[i] cache is currently empty.\n")
+        return
+
+    total_size = 0
+    sys.stdout.write(f"\n{Fore.WHITE}{'cached item':<35} | {'size'}\n")
+    sys.stdout.write("-" * 50 + "\n")
+    for f in CACHE_DIR.iterdir():
+        if f.is_file():
+            size = f.stat().st_size
+            total_size += size
+            if size > 1024 * 1024 * 1024:
+                size_str = f"{size / (1024 * 1024 * 1024):.2f} GB"
+            elif size > 1024 * 1024:
+                size_str = f"{size / (1024 * 1024):.2f} MB"
+            else:
+                size_str = f"{size / 1024:.2f} KB"
+            sys.stdout.write(f"{Fore.CYAN}{f.name:<35} {Fore.WHITE}| {size_str}\n")
+    sys.stdout.write("-" * 50 + "\n")
+
+    if total_size > 1024 * 1024 * 1024:
+        total_str = f"{total_size / (1024 * 1024 * 1024):.2f} GB"
+    elif total_size > 1024 * 1024:
+        total_str = f"{total_size / (1024 * 1024):.2f} MB"
+    else:
+        total_str = f"{total_size / 1024:.2f} KB"
+
+    sys.stdout.write(f"{Fore.BLUE}[i] total storage used by cache: {total_str}\n\n")
+
+def cli_helper():
+    sys.stdout.write(f"\n{Fore.CYAN}{Style.BRIGHT}=== mpreg v8.0 Helper ==={Style.RESET_ALL}\n")
+    while True:
+        sys.stdout.write(f"\n{Fore.WHITE}1. list packages\n")
+        sys.stdout.write("2. list misc files\n")
+        sys.stdout.write("3. install package\n")
+        sys.stdout.write("4. uninstall package\n")
+        sys.stdout.write("5. update caches\n")
+        sys.stdout.write("6. integrity check\n")
+        sys.stdout.write("7. pack binary\n")
+        sys.stdout.write("8. view cache usage\n")
+        sys.stdout.write("9. clear cache\n")
+        sys.stdout.write("0. exit\n")
+
+        choice = input(f"\n{Fore.WHITE}choose an option> {Style.RESET_ALL}").strip()
+
+        if choice == "1":
+            list_pkgs()
+        elif choice == "2":
+            list_misc()
+        elif choice == "3":
+            pkg = input(f"{Fore.WHITE}enter package id: {Style.RESET_ALL}").strip()
+            if pkg: install_pkg(pkg)
+        elif choice == "4":
+            pkg = input(f"{Fore.WHITE}enter package id: {Style.RESET_ALL}").strip()
+            if pkg: uninstall_pkg(pkg)
+        elif choice == "5":
+            sys.stdout.write(f"{Fore.CYAN}[*] forcing cache update...\n")
+            fetch_json(PACKAGE_LIST_URL)
+            fetch_json(MISC_LIST_URL)
+            sys.stdout.write(f"{Fore.GREEN}[s] update complete.\n")
+        elif choice == "6":
+            check_pkgs()
+        elif choice == "7":
+            f = input(f"{Fore.WHITE}enter path to binary file: {Style.RESET_ALL}").strip()
+            if f: pack_pkg(f)
+        elif choice == "8":
+            list_cache()
+        elif choice == "9":
+            sys.stdout.write(f"{Fore.CYAN}[*] wiping cache directory...\n")
+            shutil.rmtree(CACHE_DIR)
+            CACHE_DIR.mkdir()
+            sys.stdout.write(f"{Fore.GREEN}[s] cache cleared.\n")
+        elif choice == "0":
+            sys.stdout.write(f"{Fore.CYAN}[*] exiting helper. Goodbye.\n")
+            break
+        else:
+            sys.stdout.write(f"{Fore.RED}[x] invalid option selected.\n")
+
+def main():
+    ensure_dirs()
+    if len(sys.argv) == 1:
+        cli_helper()
+        return
+
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list-pkgs")
+    sub.add_parser("list-misc")
+    sub.add_parser("update")
+    sub.add_parser("check")
+    sub.add_parser("cache")
+    sub.add_parser("cache-clear")
+
+    ip = sub.add_parser("install")
+    ip.add_argument("id")
+
+    un = sub.add_parser("uninstall")
+    un.add_argument("id")
+
+    vp = sub.add_parser("view-pkg")
+    vp.add_argument("id")
+
+    pk = sub.add_parser("pack")
+    pk.add_argument("file")
+
+    args = p.parse_args()
+
+    if args.cmd == "list-pkgs":
+        list_pkgs()
+    elif args.cmd == "list-misc":
+        list_misc()
+    elif args.cmd == "update":
+        fetch_json(PACKAGE_LIST_URL)
+        fetch_json(MISC_LIST_URL)
+        sys.stdout.write(f"{Fore.GREEN}[s] caches updated.\n")
+    elif args.cmd == "check":
+        check_pkgs()
+    elif args.cmd == "cache":
+        list_cache()
+    elif args.cmd == "cache-clear":
+        sys.stdout.write(f"{Fore.CYAN}[*] wiping cache directory...\n")
+        shutil.rmtree(CACHE_DIR)
+        CACHE_DIR.mkdir()
+        sys.stdout.write(f"{Fore.GREEN}[s] cache cleared.\n")
+    elif args.cmd == "install":
+        install_pkg(args.id)
+    elif args.cmd == "uninstall":
+        uninstall_pkg(args.id)
+    elif args.cmd == "pack":
+        pack_pkg(args.file)
+    elif args.cmd == "view-pkg":
+        sys.stdout.write(f"{Fore.CYAN}[*] fetching details for {args.id}...\n")
+        data = fetch_json(PACKAGE_LIST_URL)
+        if data and args.id in data:
+            sys.stdout.write(json.dumps(data[args.id], indent=2) + "\n")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.stdout.write(f"\n{Fore.RED}[x] keyboard interrupt, aborted by user.\n")
+        sys.exit(1)
