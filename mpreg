@@ -356,26 +356,26 @@ def main():
 
     p = argparse.ArgumentParser(
         prog="mpreg",
-        description=f"{Fore.CYAN}{Style.BRIGHT}mpreg v8.0 - the mrrpos package registrar{Style.RESET_ALL}"
+        description=f"{Fore.CYAN}{Style.BRIGHT}mpreg v8.0 - The Mrrpos Package REGistrar{Style.RESET_ALL}"
     )
     sub = p.add_subparsers(dest="cmd", required=True, title="commands")
-    
+
     sub.add_parser("list-pkgs", help="list all available packages in the remote repository")
     sub.add_parser("list-misc", help="list all available miscellaneous files")
     sub.add_parser("update", help="update the local package and misc caches")
     sub.add_parser("check", help="verify the sha256 integrity of installed packages")
     sub.add_parser("cache", help="view all cached items and storage usage")
     sub.add_parser("cache-clear", help="wipe the cache directory to free up space")
-    
+
     ip = sub.add_parser("install", help="install or update a package by its id")
     ip.add_argument("id", help="the id of the package to install")
-    
+
     un = sub.add_parser("uninstall", help="uninstall a package from the system")
     un.add_argument("id", help="the id of the package to remove")
-    
+
     vp = sub.add_parser("view-pkg", help="view raw json metadata for a specific package")
     vp.add_argument("id", help="the id of the package to view")
-    
+
     pk = sub.add_parser("pack", help="compress a binary into an .mpreg (zstd -19) archive")
     pk.add_argument("file", help="path to the binary file to pack")
 
