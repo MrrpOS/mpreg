@@ -351,82 +351,37 @@ def list_cache():
 
     sys.stdout.write(f"{Fore.BLUE}[i] total storage used by cache: {total_str}\n\n")
 
-def cli_helper():
-    sys.stdout.write(f"\n{Fore.CYAN}{Style.BRIGHT}=== mpreg v8.0 Helper ==={Style.RESET_ALL}\n")
-    while True:
-        sys.stdout.write(f"\n{Fore.WHITE}1. list packages\n")
-        sys.stdout.write("2. list misc files\n")
-        sys.stdout.write("3. install package\n")
-        sys.stdout.write("4. uninstall package\n")
-        sys.stdout.write("5. update caches\n")
-        sys.stdout.write("6. integrity check\n")
-        sys.stdout.write("7. pack binary\n")
-        sys.stdout.write("8. view cache usage\n")
-        sys.stdout.write("9. clear cache\n")
-        sys.stdout.write("0. exit\n")
-
-        choice = input(f"\n{Fore.WHITE}choose an option> {Style.RESET_ALL}").strip()
-
-        if choice == "1":
-            list_pkgs()
-        elif choice == "2":
-            list_misc()
-        elif choice == "3":
-            pkg = input(f"{Fore.WHITE}enter package id: {Style.RESET_ALL}").strip()
-            if pkg: install_pkg(pkg)
-        elif choice == "4":
-            pkg = input(f"{Fore.WHITE}enter package id: {Style.RESET_ALL}").strip()
-            if pkg: uninstall_pkg(pkg)
-        elif choice == "5":
-            sys.stdout.write(f"{Fore.CYAN}[*] forcing cache update...\n")
-            fetch_json(PACKAGE_LIST_URL)
-            fetch_json(MISC_LIST_URL)
-            sys.stdout.write(f"{Fore.GREEN}[s] update complete.\n")
-        elif choice == "6":
-            check_pkgs()
-        elif choice == "7":
-            f = input(f"{Fore.WHITE}enter path to binary file: {Style.RESET_ALL}").strip()
-            if f: pack_pkg(f)
-        elif choice == "8":
-            list_cache()
-        elif choice == "9":
-            sys.stdout.write(f"{Fore.CYAN}[*] wiping cache directory...\n")
-            shutil.rmtree(CACHE_DIR)
-            CACHE_DIR.mkdir()
-            sys.stdout.write(f"{Fore.GREEN}[s] cache cleared.\n")
-        elif choice == "0":
-            sys.stdout.write(f"{Fore.CYAN}[*] exiting helper. Goodbye.\n")
-            break
-        else:
-            sys.stdout.write(f"{Fore.RED}[x] invalid option selected.\n")
-
 def main():
     ensure_dirs()
+
+    p = argparse.ArgumentParser(
+        prog="mpreg",
+        description=f"{Fore.CYAN}{Style.BRIGHT}mpreg v8.0 - the mrrpos package registrar{Style.RESET_ALL}"
+    )
+    sub = p.add_subparsers(dest="cmd", required=True, title="commands")
+    
+    sub.add_parser("list-pkgs", help="list all available packages in the remote repository")
+    sub.add_parser("list-misc", help="list all available miscellaneous files")
+    sub.add_parser("update", help="update the local package and misc caches")
+    sub.add_parser("check", help="verify the sha256 integrity of installed packages")
+    sub.add_parser("cache", help="view all cached items and storage usage")
+    sub.add_parser("cache-clear", help="wipe the cache directory to free up space")
+    
+    ip = sub.add_parser("install", help="install or update a package by its id")
+    ip.add_argument("id", help="the id of the package to install")
+    
+    un = sub.add_parser("uninstall", help="uninstall a package from the system")
+    un.add_argument("id", help="the id of the package to remove")
+    
+    vp = sub.add_parser("view-pkg", help="view raw json metadata for a specific package")
+    vp.add_argument("id", help="the id of the package to view")
+    
+    pk = sub.add_parser("pack", help="compress a binary into an .mpreg (zstd -19) archive")
+    pk.add_argument("file", help="path to the binary file to pack")
+
     if len(sys.argv) == 1:
-        cli_helper()
-        return
-
-    p = argparse.ArgumentParser()
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    sub.add_parser("list-pkgs")
-    sub.add_parser("list-misc")
-    sub.add_parser("update")
-    sub.add_parser("check")
-    sub.add_parser("cache")
-    sub.add_parser("cache-clear")
-
-    ip = sub.add_parser("install")
-    ip.add_argument("id")
-
-    un = sub.add_parser("uninstall")
-    un.add_argument("id")
-
-    vp = sub.add_parser("view-pkg")
-    vp.add_argument("id")
-
-    pk = sub.add_parser("pack")
-    pk.add_argument("file")
+        p.print_help()
+        sys.exit(0)
 
     args = p.parse_args()
 
